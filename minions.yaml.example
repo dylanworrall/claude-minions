@@ -1,0 +1,30 @@
+# minions.yaml — Define your agent pipeline
+#
+# Each task runs sequentially: branch → agent builds → verify → fix → commit → merge
+# Tasks are isolated — each gets a clean branch off main.
+#
+# The Stripe pattern: deterministic shell wraps agentic execution.
+# The LLM only does what requires intelligence. Everything else is bash.
+
+tasks:
+  - name: "Fix authentication bug"
+    prompt: |
+      The login flow is broken — users get a 401 after OAuth redirect.
+      Check the OAuth callback handler and token exchange logic.
+      Fix the bug and add a test to prevent regression.
+
+  - name: "Add rate limiting to API"
+    prompt: |
+      Add rate limiting to all API endpoints.
+      Use a sliding window algorithm.
+      Limit to 100 requests per minute per API key.
+      Return 429 with Retry-After header when exceeded.
+      Add tests.
+
+  - name: "Improve error handling in worker"
+    prompt: |
+      The background worker crashes silently on network errors.
+      Add retry logic with exponential backoff (max 3 retries).
+      Log failures to the audit table.
+      Add a dead letter queue for permanently failed jobs.
+      Add tests.

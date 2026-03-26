@@ -1,0 +1,3 @@
+.minions/
+*.log
+.DS_Store
