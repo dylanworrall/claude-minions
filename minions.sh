@@ -104,10 +104,21 @@ MODE=""  # spec, goal, tasks, adhoc
 if [[ -f "$CONFIG_FILE" ]]; then
   det "Reading config: $CONFIG_FILE"
 
-  # Parse goal (takes priority over spec)
-  GOAL=$(awk '/^goal:/{found=1; next} found && /^[^ ]/{exit} found{gsub(/^  /,""); print}' "$CONFIG_FILE" 2>/dev/null)
-  # Single-line goal
-  [[ -z "$GOAL" ]] && GOAL=$(grep '^goal:' "$CONFIG_FILE" 2>/dev/null | sed 's/^goal: *//' | sed 's/"//g')
+  # Parse goal (takes priority over spec) — handles YAML multiline block scalar (goal: |)
+  GOAL=$(awk '
+    /^goal:/ {
+      found=1
+      # Check for single-line goal (goal: "some text")
+      sub(/^goal:[[:space:]]*\|?[[:space:]]*$/, "", $0)
+      if ($0 != "") { print $0; found=0 }
+      next
+    }
+    found && /^[a-zA-Z]/ { exit }
+    found && /^[^ ]/ { exit }
+    found { gsub(/^    /, ""); gsub(/^  /, ""); print }
+  ' "$CONFIG_FILE" 2>/dev/null)
+  # Trim leading/trailing whitespace
+  GOAL=$(echo "$GOAL" | sed '/^$/d' | head -50)
 
   # Parse spec files
   SPEC_FILES=$(grep -A100 '^spec:' "$CONFIG_FILE" 2>/dev/null | grep '^ *- ' | sed 's/^ *- //' | sed 's/"//g' | head -20)
@@ -744,8 +755,9 @@ log "  Verify:  $VERIFY_CMD"
 log "  Mode:    $(if [[ -n "$SINGLE_TASK" ]]; then echo "ad-hoc"; elif [[ -n "$TASKS_FILE" ]]; then echo "task-list"; else echo "spec-driven"; fi)"
 log "═══════════════════════════════════════════════"
 
-# Auth check
-if ! claude -p "echo ok" --max-turns 1 --bare 2>/dev/null | grep -qi "ok"; then
+# Auth check — try a simple prompt, fail only if "Not logged in" appears
+AUTH_RESULT=$(claude -p "Say OK" --max-turns 1 2>&1 || true)
+if echo "$AUTH_RESULT" | grep -qi "not logged in"; then
   log "ERROR: claude -p not authenticated. Run: claude /login"
   exit 1
 fi
