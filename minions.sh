@@ -21,7 +21,7 @@
 #
 set -uo pipefail
 
-VERSION="3.0.0"
+VERSION="3.1.0"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
@@ -91,6 +91,42 @@ fail() { log "✗ FAIL  $1"; FAILED=$((FAILED + 1)); }
 
 slug() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-40
+}
+
+# Rate-limit-aware claude wrapper — detects "hit your limit", waits, retries
+claude_with_retry() {
+  local OUTPUT_FILE=$(mktemp)
+  local MAX_WAIT_ATTEMPTS=12  # 12 x 5min = 60min max wait
+
+  for ATTEMPT in $(seq 1 $MAX_WAIT_ATTEMPTS); do
+    claude "$@" 2>&1 | tee "$OUTPUT_FILE"
+    local EXIT_CODE=${PIPESTATUS[0]}
+
+    # Check if output contains rate limit message
+    if grep -qi "hit your limit\|rate limit\|resets.*am\|resets.*pm\|too many requests\|429" "$OUTPUT_FILE" 2>/dev/null; then
+      # Extract reset time if present
+      local RESET_TIME=$(grep -oi "resets [0-9]*[ap]m\|resets [0-9]*:[0-9]*" "$OUTPUT_FILE" | head -1)
+      det "RATE LIMITED${RESET_TIME:+ ($RESET_TIME)}. Waiting 5 minutes... (attempt $ATTEMPT/$MAX_WAIT_ATTEMPTS)"
+      sleep 300  # 5 minutes
+      det "Retrying after cooldown..."
+      continue
+    fi
+
+    # Check for "Not logged in"
+    if grep -qi "not logged in" "$OUTPUT_FILE" 2>/dev/null; then
+      det "AUTH ERROR: Not logged in. Run: claude /login"
+      rm -f "$OUTPUT_FILE"
+      return 1
+    fi
+
+    # Success — no rate limit
+    rm -f "$OUTPUT_FILE"
+    return $EXIT_CODE
+  done
+
+  det "RATE LIMITED for $((MAX_WAIT_ATTEMPTS * 5)) minutes. Giving up."
+  rm -f "$OUTPUT_FILE"
+  return 1
 }
 
 # ─── Read config ──────────────────────────────────────────────────────
@@ -231,7 +267,7 @@ run_task() {
 
   # ── [AGENTIC] Implement ──
   agt "Building: $TASK_NAME"
-  claude -p "$PROMPT
+  claude_with_retry -p "$PROMPT
 $PROJECT_CONTEXT
 
 RULES:
@@ -261,7 +297,7 @@ RULES:
     while [[ $RETRY -lt $MAX_RETRIES ]]; do
       RETRY=$((RETRY + 1))
       agt "Fix attempt $RETRY/$MAX_RETRIES"
-      claude -p "Build/compile failed. Fix ONLY these errors:
+      claude_with_retry -p "Build/compile failed. Fix ONLY these errors:
 
 $VERIFY_ERRORS" \
         --max-turns "$FIX_TURNS" \
@@ -449,7 +485,7 @@ RULES:
   fi
 
   agt "Analyzing codebase against spec"
-  claude -p "$ANALYSIS_PROMPT" \
+  claude_with_retry -p "$ANALYSIS_PROMPT" \
     --max-turns "$ANALYZE_TURNS" \
     --allowedTools "Read,Grep,Glob,Bash" \
     2>&1 | tee "$STATE_DIR/analysis-iter$ITERATION_NUM.txt"
@@ -545,7 +581,7 @@ REMAINING:
 VERDICT: DONE | NEEDS_WORK"
   fi
 
-  claude -p "$VERIFY_PROMPT" \
+  claude_with_retry -p "$VERIFY_PROMPT" \
     --max-turns "$ANALYZE_TURNS" \
     --allowedTools "Read,Grep,Glob,Bash" \
     2>&1 | tee "$STATE_DIR/verify-iter$ITERATION_NUM.txt"
@@ -636,7 +672,7 @@ qa_test() {
 
   # [AGENTIC] QA the running app
   agt "QA testing the running app"
-  claude -p "You are QA testing a running web application at $APP_URL.
+  claude_with_retry -p "You are QA testing a running web application at $APP_URL.
 
 You have a headless browser at: $B
 
@@ -755,11 +791,16 @@ log "  Verify:  $VERIFY_CMD"
 log "  Mode:    $(if [[ -n "$SINGLE_TASK" ]]; then echo "ad-hoc"; elif [[ -n "$TASKS_FILE" ]]; then echo "task-list"; else echo "spec-driven"; fi)"
 log "═══════════════════════════════════════════════"
 
-# Auth check — try a simple prompt, fail only if "Not logged in" appears
+# Auth check — try a simple prompt, wait if rate limited
+det "Checking auth..."
 AUTH_RESULT=$(claude -p "Say OK" --max-turns 1 2>&1 || true)
 if echo "$AUTH_RESULT" | grep -qi "not logged in"; then
   log "ERROR: claude -p not authenticated. Run: claude /login"
   exit 1
+elif echo "$AUTH_RESULT" | grep -qi "hit your limit\|rate limit\|resets"; then
+  RESET_TIME=$(echo "$AUTH_RESULT" | grep -oi "resets [0-9]*[ap]m\|resets [0-9]*:[0-9]*" | head -1)
+  det "Rate limited${RESET_TIME:+ ($RESET_TIME)}. Waiting 5 minutes before starting..."
+  sleep 300
 fi
 det "Claude authenticated ✓"
 
