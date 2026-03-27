@@ -1,0 +1,27 @@
+# minions.config.yaml — Point the minions at your spec
+#
+# The minions read these files, compare to your codebase,
+# auto-generate tasks, build until the spec is satisfied.
+
+# Spec files: the source of truth for what the project should be.
+# The minions will read these and build until everything in them exists.
+spec:
+  - ~/soshibrain/Planning/Soshi Master Plan.md
+  - ~/soshibrain/Planning/Sprint Plan - Ship Week.md
+
+# Context files: additional reference material (not requirements, just context)
+context:
+  - CLAUDE.md
+  - ~/soshibrain/Architecture/Soshi Architecture.md
+
+# Verification command (auto-detected if not set)
+# verify: "npx tsc --noEmit"
+
+# Test command (auto-detected if not set)
+# test: "npx vitest run"
+
+# Branch to merge into
+main_branch: main
+
+# Max convergence loop iterations (prevents infinite loops)
+max_iterations: 10
