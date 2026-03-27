@@ -21,7 +21,7 @@
 #
 set -uo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
@@ -454,6 +454,132 @@ execute_tasks() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
+# QA: Start the app and test it with a browser
+# ═══════════════════════════════════════════════════════════════════════
+qa_test() {
+  local ITERATION_NUM=$1
+  local QA_LOG="$STATE_DIR/qa-iter$ITERATION_NUM.txt"
+  local QA_SCREENSHOTS="$STATE_DIR/screenshots-iter$ITERATION_NUM"
+  mkdir -p "$QA_SCREENSHOTS"
+
+  # Check for browse binary
+  local B=""
+  [[ -x "$HOME/.claude/skills/gstack/browse/dist/browse" ]] && B="$HOME/.claude/skills/gstack/browse/dist/browse"
+  if [[ -z "$B" ]]; then
+    det "No browse binary — skipping QA (install gstack for browser testing)"
+    return 0
+  fi
+
+  # Read start command from config or auto-detect
+  local START_CMD=""
+  START_CMD=$(grep '^start:' "$CONFIG_FILE" 2>/dev/null | sed 's/^start: *//' | sed 's/"//g')
+  if [[ -z "$START_CMD" ]]; then
+    if [[ -f "package.json" ]] && grep -q '"dev"' package.json; then
+      START_CMD="npm run dev"
+    elif [[ -f "mix.exs" ]]; then
+      START_CMD="mix phx.server"
+    else
+      det "No start command found — skipping QA"
+      return 0
+    fi
+  fi
+
+  # Read app URL from config or default
+  local APP_URL=""
+  APP_URL=$(grep '^url:' "$CONFIG_FILE" 2>/dev/null | sed 's/^url: *//' | sed 's/"//g')
+  [[ -z "$APP_URL" ]] && APP_URL="http://localhost:3000"
+
+  det "Starting app: $START_CMD"
+  eval "$START_CMD" &
+  APP_PID=$!
+
+  # Wait for app to be ready
+  det "Waiting for $APP_URL to respond..."
+  local RETRIES=0
+  while [[ $RETRIES -lt 30 ]]; do
+    if curl -s -o /dev/null -w "%{http_code}" "$APP_URL" 2>/dev/null | grep -q "200\|304\|302\|301"; then
+      det "App is ready"
+      break
+    fi
+    sleep 2
+    RETRIES=$((RETRIES + 1))
+  done
+
+  if [[ $RETRIES -ge 30 ]]; then
+    det "App didn't start in 60s — skipping QA"
+    kill $APP_PID 2>/dev/null || true
+    return 0
+  fi
+
+  # [AGENTIC] QA the running app
+  agt "QA testing the running app"
+  claude -p "You are QA testing a running web application at $APP_URL.
+
+You have a headless browser at: $B
+
+$SPEC_CONTEXT
+$PROJECT_CONTEXT
+
+TEST THE APP using the browse binary. For each test:
+1. Navigate: $B goto $APP_URL
+2. Take screenshot: $B screenshot $QA_SCREENSHOTS/test-name.png
+3. Check content: $B text
+4. Check for errors: $B console --errors
+5. Test interactions: $B snapshot -i then $B click @e1, $B fill @e2 \"test\", etc.
+
+TEST THESE FLOWS (based on the spec):
+- Does the main page load without JS errors?
+- Do all navigation links work?
+- Does the chat/agent interface work? (send a message, get response)
+- Do forms submit correctly?
+- Are there any console errors?
+- Do interactive elements respond?
+
+After testing, output:
+
+QA_SCORE: [0-100]
+BUGS_FOUND:
+- [bug 1: what's broken, screenshot path]
+- [bug 2: ...]
+QA_VERDICT: PASS | FAIL
+
+If FAIL, describe each bug clearly so a developer can fix it." \
+    --max-turns 30 \
+    --allowedTools "Read,Bash,Grep,Glob" \
+    2>&1 | tee "$QA_LOG"
+
+  # Kill the app
+  det "Stopping app (PID $APP_PID)"
+  kill $APP_PID 2>/dev/null || true
+  wait $APP_PID 2>/dev/null || true
+
+  # Parse QA results
+  if grep -q "QA_VERDICT: PASS" "$QA_LOG"; then
+    det "QA PASSED ✓"
+    echo "QA: PASSED" >> "$STATE_DIR/results-iter$ITERATION.txt"
+    return 0
+  else
+    det "QA FAILED — bugs found"
+    # Extract bugs and create fix tasks
+    local BUGS=$(grep -A1 "BUGS_FOUND:" "$QA_LOG" | grep "^- " | head -10)
+    if [[ -n "$BUGS" ]]; then
+      echo "QA: FAILED — bugs found" >> "$STATE_DIR/results-iter$ITERATION.txt"
+
+      # Run a fix agent for QA bugs
+      run_task "Fix QA bugs (iteration $ITERATION_NUM)" \
+        "The QA test found these bugs in the running app:
+
+$BUGS
+
+Screenshots are in $QA_SCREENSHOTS/ — read them for visual context.
+
+Fix each bug. The app runs at $APP_URL with '$START_CMD'."
+    fi
+    return 1
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
 # Parse minions.yaml (for --tasks mode)
 # ═══════════════════════════════════════════════════════════════════════
 run_yaml_tasks() {
@@ -587,6 +713,13 @@ else
     # [DETERMINISTIC] Push progress
     det "Pushing to origin"
     git push origin "$MAIN_BRANCH" 2>&1 | tee -a "$MASTER_LOG" || true
+
+    # [MIXED] QA test the running app (if configured)
+    local SKIP_QA=""
+    SKIP_QA=$(grep '^skip_qa:' "$CONFIG_FILE" 2>/dev/null | sed 's/^skip_qa: *//')
+    if [[ "$SKIP_QA" != "true" ]]; then
+      qa_test $ITERATION
+    fi
 
     # [AGENTIC] Verify spec coverage
     if verify_spec $ITERATION; then

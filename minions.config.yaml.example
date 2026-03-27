@@ -20,6 +20,12 @@ context:
 # Test command (auto-detected if not set)
 # test: "npx vitest run"
 
+# QA testing: start the app and test with a headless browser
+# Requires gstack browse binary (~/.claude/skills/gstack/browse/dist/browse)
+start: "npm run dev"              # Command to start the app
+url: "http://localhost:3000"      # URL to test against
+# skip_qa: true                  # Set to true to skip browser QA
+
 # Branch to merge into
 main_branch: main
 
