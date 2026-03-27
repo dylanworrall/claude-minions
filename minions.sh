@@ -21,7 +21,7 @@
 #
 set -uo pipefail
 
-VERSION="2.1.0"
+VERSION="3.0.0"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
@@ -98,9 +98,16 @@ SPEC_FILES=""
 CONTEXT_FILES=""
 CUSTOM_VERIFY=""
 CUSTOM_TEST=""
+GOAL=""
+MODE=""  # spec, goal, tasks, adhoc
 
 if [[ -f "$CONFIG_FILE" ]]; then
   det "Reading config: $CONFIG_FILE"
+
+  # Parse goal (takes priority over spec)
+  GOAL=$(awk '/^goal:/{found=1; next} found && /^[^ ]/{exit} found{gsub(/^  /,""); print}' "$CONFIG_FILE" 2>/dev/null)
+  # Single-line goal
+  [[ -z "$GOAL" ]] && GOAL=$(grep '^goal:' "$CONFIG_FILE" 2>/dev/null | sed 's/^goal: *//' | sed 's/"//g')
 
   # Parse spec files
   SPEC_FILES=$(grep -A100 '^spec:' "$CONFIG_FILE" 2>/dev/null | grep '^ *- ' | sed 's/^ *- //' | sed 's/"//g' | head -20)
@@ -292,14 +299,15 @@ Built by claude-minions v$VERSION (iteration $ITERATION)" 2>&1 | tee -a "$TASK_L
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-# ANALYZE: Read spec + codebase, generate task list
+# ANALYZE: Read codebase, figure out what to do
+# Two modes: spec-driven (compare to spec) or goal-driven (figure it out)
 # ═══════════════════════════════════════════════════════════════════════
 analyze() {
   local ITERATION_NUM=$1
   local TASK_LIST_FILE="$STATE_DIR/tasks-iter$ITERATION_NUM.json"
   local PREV_RESULTS="$STATE_DIR/results-iter$((ITERATION_NUM - 1)).txt"
 
-  det "Analyzing: iteration $ITERATION_NUM"
+  det "Analyzing: iteration $ITERATION_NUM (mode: $MODE)"
 
   local PREV_CONTEXT=""
   if [[ -f "$PREV_RESULTS" ]]; then
@@ -308,9 +316,64 @@ PREVIOUS ITERATION RESULTS (do NOT repeat completed tasks):
 $(cat "$PREV_RESULTS")"
   fi
 
-  # The analysis prompt changes based on iteration
+  # QA results from previous iteration
+  local QA_CONTEXT=""
+  local PREV_QA="$STATE_DIR/qa-iter$((ITERATION_NUM - 1)).txt"
+  if [[ -f "$PREV_QA" ]]; then
+    QA_CONTEXT="
+QA TEST RESULTS FROM PREVIOUS ITERATION (bugs found by browser testing):
+$(tail -50 "$PREV_QA")"
+  fi
+
   local ANALYSIS_PROMPT=""
-  if [[ $ITERATION_NUM -eq 1 ]]; then
+
+  if [[ "$MODE" == "goal" ]]; then
+    # ── GOAL-DRIVEN MODE ──
+    # The agent explores the codebase, understands the goal, and decides what to do
+    ANALYSIS_PROMPT="You are an autonomous developer. Your job is to make this project achieve its goal.
+
+THE GOAL:
+$GOAL
+
+$PROJECT_CONTEXT
+$PREV_CONTEXT
+$QA_CONTEXT
+
+You have FULL AUTONOMY to decide what needs to happen. There is no spec to follow — you decide what to build, fix, improve, or remove based on the goal.
+
+APPROACH:
+1. Read the codebase thoroughly — understand what exists, what works, what's broken
+2. Think about the GOAL — what does 'done' look like? What would a user experience?
+3. Identify the HIGHEST IMPACT work — what's the most broken/missing thing that blocks the goal?
+4. Generate tasks to fix it, ordered by impact
+
+YOU DECIDE:
+- What architecture to use
+- What files to create or modify
+- What patterns to follow
+- What to prioritize
+- What to skip (if it's not needed for the goal)
+
+The only constraint: each task must be completable in one session (~40 turns).
+
+OUTPUT FORMAT (exactly this, parseable):
+---TASKS---
+TASK: [short name]
+PROMPT: [what to do and why — be specific about files, but let the implementing agent make design decisions]
+---
+TASK: [next task]
+PROMPT: [instructions]
+---
+---END---
+
+If the goal is ACHIEVED (the project works as described), output:
+---TASKS---
+---DONE---
+
+Max 8 tasks per iteration. Focus on what MATTERS MOST for the goal."
+
+  elif [[ $ITERATION_NUM -eq 1 ]]; then
+    # ── SPEC-DRIVEN MODE: First iteration ──
     ANALYSIS_PROMPT="You are analyzing a codebase against its spec to determine what needs to be built.
 
 $SPEC_CONTEXT
@@ -340,17 +403,20 @@ RULES:
 - Be SPECIFIC in prompts — file paths, function names, expected behavior
 - Max 10 tasks per iteration (do the most important ones first)"
   else
+    # ── SPEC-DRIVEN MODE: Subsequent iterations ──
     ANALYSIS_PROMPT="You are re-analyzing a codebase after a development iteration. Some tasks were completed, some failed.
 
 $SPEC_CONTEXT
 $PROJECT_CONTEXT
 $PREV_CONTEXT
+$QA_CONTEXT
 
 RE-ANALYZE:
 1. Read the spec files
 2. Read the CURRENT codebase (it has changed since last iteration)
 3. Check what was completed vs what still has gaps
-4. Generate tasks ONLY for remaining gaps
+4. If there are QA bugs from browser testing, prioritize fixing those
+5. Generate tasks ONLY for remaining gaps
 
 OUTPUT FORMAT (exactly this, parseable):
 ---TASKS---
@@ -366,6 +432,7 @@ If the project FULLY SATISFIES the spec, output:
 RULES:
 - Do NOT repeat tasks that already passed
 - Failed tasks can be retried with a different approach
+- QA bugs are HIGH PRIORITY — fix them first
 - Be specific about what's STILL missing
 - Max 10 tasks"
   fi
@@ -405,8 +472,47 @@ RULES:
 verify_spec() {
   local ITERATION_NUM=$1
 
-  agt "Verifying spec coverage"
-  claude -p "You are verifying whether a codebase satisfies its spec.
+  local VERIFY_PROMPT=""
+
+  if [[ "$MODE" == "goal" ]]; then
+    # ── GOAL-DRIVEN VERIFICATION ──
+    # Don't check against a spec — check if the goal is achieved
+    agt "Verifying goal achievement"
+    VERIFY_PROMPT="You are verifying whether a project achieves its goal.
+
+THE GOAL:
+$GOAL
+
+$PROJECT_CONTEXT
+
+VERIFY by actually examining the project:
+1. Read the codebase — does the code look production-quality?
+2. Check if the core user flows would work (trace the logic, check for missing pieces)
+3. Look for broken imports, missing files, dead code, incomplete features
+4. Think like a USER — would this app achieve the goal?
+
+Also consider QA results if available:
+$(cat "$STATE_DIR/qa-iter$ITERATION_NUM.txt" 2>/dev/null | tail -30)
+
+SCORE the project on:
+- Functionality: does it do what the goal describes? (0-100)
+- Quality: is the code clean, typed, error-handled? (0-100)
+- Completeness: are there half-built features? (0-100)
+
+OUTPUT FORMAT:
+FUNCTIONALITY: [number]%
+QUALITY: [number]%
+COMPLETENESS: [number]%
+OVERALL: [number]%
+REMAINING:
+- [most important gap]
+- [second most important]
+...
+VERDICT: DONE | NEEDS_WORK"
+  else
+    # ── SPEC-DRIVEN VERIFICATION ──
+    agt "Verifying spec coverage"
+    VERIFY_PROMPT="You are verifying whether a codebase satisfies its spec.
 
 $SPEC_CONTEXT
 $PROJECT_CONTEXT
@@ -416,21 +522,27 @@ CHECK every requirement in the spec files against the actual codebase:
 2. For each requirement/feature, check if it exists in the code
 3. Score: what percentage of the spec is implemented?
 
+Also consider QA results if available:
+$(cat "$STATE_DIR/qa-iter$ITERATION_NUM.txt" 2>/dev/null | tail -30)
+
 OUTPUT FORMAT:
 COVERAGE: [number]%
 REMAINING:
 - [gap 1]
 - [gap 2]
 ...
-VERDICT: DONE | NEEDS_WORK" \
+VERDICT: DONE | NEEDS_WORK"
+  fi
+
+  claude -p "$VERIFY_PROMPT" \
     --max-turns "$ANALYZE_TURNS" \
     --allowedTools "Read,Grep,Glob,Bash" \
     2>&1 | tee "$STATE_DIR/verify-iter$ITERATION_NUM.txt"
 
   if grep -q "VERDICT: DONE" "$STATE_DIR/verify-iter$ITERATION_NUM.txt"; then
-    return 0  # Spec satisfied
+    return 0
   fi
-  return 1  # Gaps remain
+  return 1
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -656,18 +768,29 @@ elif [[ "$VERIFY_ONLY" == "true" ]]; then
   verify_spec 0
   exit $?
 
-# ─── Mode: Spec-driven convergence loop ──────────────────────────────
+# ─── Mode: Spec-driven or Goal-driven convergence loop ────────────────
 else
-  if [[ -z "$SPEC_FILES" ]]; then
-    log "ERROR: No spec files. Create minions.config.yaml with spec: section, or use --tasks"
+  # Determine mode
+  if [[ -n "$GOAL" ]]; then
+    MODE="goal"
+  elif [[ -n "$SPEC_FILES" ]]; then
+    MODE="spec"
+  else
+    log "ERROR: No goal or spec files. Add goal: or spec: to minions.config.yaml"
     exit 1
   fi
 
   log ""
-  log "Spec files:"
-  while IFS= read -r f; do
-    [[ -n "$f" ]] && log "  → $f"
-  done <<< "$SPEC_FILES"
+  if [[ "$MODE" == "goal" ]]; then
+    log "Mode: GOAL-DRIVEN (autonomous)"
+    log "Goal: $(echo "$GOAL" | head -3)..."
+  else
+    log "Mode: SPEC-DRIVEN"
+    log "Spec files:"
+    while IFS= read -r f; do
+      [[ -n "$f" ]] && log "  → $f"
+    done <<< "$SPEC_FILES"
+  fi
   log ""
 
   # ── THE CONVERGENCE LOOP ──
