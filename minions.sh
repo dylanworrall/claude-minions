@@ -24,7 +24,7 @@
 #
 set -uo pipefail
 
-VERSION="4.0.0"
+VERSION="4.1.0"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
@@ -257,9 +257,16 @@ SPEC_CONTEXT=$(build_spec_context)
 detect_task_category() {
   local TASK_NAME="$1"
   local TASK_PROMPT="$2"
-  local COMBINED="$TASK_NAME $TASK_PROMPT"
 
-  # Pattern match to detect category
+  # First: extract explicit [category] tag from task name (set by analyzer)
+  local EXPLICIT=$(echo "$TASK_NAME" | grep -oi '\[feature\]\|\[bugfix\]\|\[refactor\]\|\[test\]\|\[migration\]' | head -1 | tr -d '[]' | tr '[:upper:]' '[:lower:]')
+  if [[ -n "$EXPLICIT" ]]; then
+    echo "$EXPLICIT"
+    return
+  fi
+
+  # Fallback: keyword detection for tasks without explicit tags
+  local COMBINED="$TASK_NAME $TASK_PROMPT"
   if echo "$COMBINED" | grep -qi "fix\|bug\|broken\|error\|crash\|fail\|repair\|patch"; then
     echo "bugfix"
   elif echo "$COMBINED" | grep -qi "test\|spec\|coverage\|assert\|verify\|e2e\|unit test"; then
@@ -482,6 +489,7 @@ Built by claude-minions v$VERSION (iteration $ITERATION)" 2>&1 | tee -a "$TASK_L
 run_task_in_worktree() {
   local TASK_NAME="$1"
   local PROMPT="$2"
+  local RESULTS_FILE="$3"  # passed from execute_tasks
   local SLUG=$(slug "$TASK_NAME")
   local WORKTREE_DIR=$(mktemp -d -t "minion-$SLUG-XXXXXX")
   local BRANCH="minion/$SLUG-iter$ITERATION"
@@ -497,18 +505,26 @@ run_task_in_worktree() {
   # Create worktree
   git worktree add "$WORKTREE_DIR" -b "$BRANCH" "$MAIN_BRANCH" 2>&1 | tee -a "$TASK_LOG" || {
     fail "$TASK_NAME (worktree creation failed)"
+    echo "FAILED: $TASK_NAME (worktree creation failed)" >> "$RESULTS_FILE"
     return 1
   }
 
-  # Run agent in worktree directory
-  claude_with_retry -p "$PROMPT
+  # Run agent in worktree directory — CRITICAL: tell agent to cd first
+  claude_with_retry -p "IMPORTANT: Before doing ANYTHING, run this command first:
+cd $WORKTREE_DIR
+
+All file paths in this task are relative to $WORKTREE_DIR. You MUST work in that directory.
+
+---
+
+$PROMPT
 
 $CATEGORY_RULES
 
 $PROJECT_CONTEXT
 
 RULES:
-- Working directory: $WORKTREE_DIR
+- Working directory: $WORKTREE_DIR (you MUST cd there first)
 - Read existing code before modifying
 - Follow existing patterns
 - Do NOT modify files outside this task's scope
@@ -520,6 +536,7 @@ RULES:
   # Verify in worktree
   if ! (cd "$WORKTREE_DIR" && eval "$VERIFY_CMD") 2>&1 | tee /tmp/verify-$SLUG.log; then
     fail "$TASK_NAME (verify failed in worktree)"
+    echo "FAILED: $TASK_NAME (verify failed)" >> "$RESULTS_FILE"
     git worktree remove "$WORKTREE_DIR" --force 2>/dev/null || true
     git branch -D "$BRANCH" 2>/dev/null || true
     return 1
@@ -528,6 +545,7 @@ RULES:
   # Check for changes
   if (cd "$WORKTREE_DIR" && git diff --quiet && git diff --cached --quiet); then
     SKIPPED=$((SKIPPED + 1))
+    echo "SKIPPED: $TASK_NAME (no changes)" >> "$RESULTS_FILE"
     git worktree remove "$WORKTREE_DIR" --force 2>/dev/null || true
     git branch -D "$BRANCH" 2>/dev/null || true
     return 0
@@ -544,6 +562,7 @@ Built by claude-minions v$VERSION (parallel, iteration $ITERATION)") 2>&1 | tee 
 
   local DURATION=$(( $(date +%s) - TASK_START ))
   pass "$TASK_NAME [$CATEGORY] (${DURATION}s, parallel)"
+  echo "PASSED: $TASK_NAME" >> "$RESULTS_FILE"
   return 0
 }
 
@@ -722,10 +741,10 @@ REMAINING:
 VERDICT: DONE | NEEDS_WORK"
   fi
 
-  # IMPROVEMENT 1: Verify agent gets spec + full read access, no write
+  # Verify agent gets spec + full read access, no write, no bash
   claude_with_retry -p "$VERIFY_PROMPT" \
     --max-turns "$ANALYZE_TURNS" \
-    --allowedTools "Read,Grep,Glob,Bash" \
+    --allowedTools "Read,Grep,Glob" \
     2>&1 | tee "$STATE_DIR/verify-iter$ITERATION_NUM.txt"
 
   grep -q "VERDICT: DONE" "$STATE_DIR/verify-iter$ITERATION_NUM.txt" && return 0
@@ -786,18 +805,29 @@ qa_test() {
     return 0
   fi
 
-  # IMPROVEMENT 1: QA agent gets spec + app URL + screenshots only, no code write access
+  # QA agent gets spec/goal context + app URL + browser, no code write access
+  local QA_SPEC=""
+  if [[ "$MODE" == "goal" ]]; then
+    QA_SPEC="THE GOAL (test against this):
+$GOAL"
+  elif [[ -n "$SPEC_CONTEXT" ]]; then
+    QA_SPEC="$SPEC_CONTEXT"
+  fi
+
   agt "QA testing the running app"
   claude_with_retry -p "You are QA testing a running web app at $APP_URL.
 
+$QA_SPEC
+
 Headless browser: $B
 
-Test these flows:
+Test these flows based on the goal/spec above:
 1. Does the main page load without JS errors?
 2. Do all navigation links work?
 3. Does the chat interface work?
 4. Do forms submit correctly?
 5. Are there console errors?
+6. Do the key features from the spec/goal actually work?
 
 Commands: $B goto URL, $B screenshot PATH, $B text, $B console --errors, $B snapshot -i, $B click SELECTOR
 
@@ -864,8 +894,8 @@ execute_tasks() {
         sleep 1
       done
 
-      # Launch in background
-      run_task_in_worktree "$TASK_NAME" "$TASK_PROMPT" &
+      # Launch in background (pass results file for tracking)
+      run_task_in_worktree "$TASK_NAME" "$TASK_PROMPT" "$RESULTS_FILE" &
       PIDS+=($!)
       RUNNING=$((RUNNING + 1))
     done < "$TASK_FILE"
@@ -875,18 +905,36 @@ execute_tasks() {
       wait "$PID" || true
     done
 
-    # Merge all parallel branches
+    # Merge all parallel branches with conflict resolution
     det "Merging parallel branches"
     git checkout "$MAIN_BRANCH" 2>&1
+    local MERGE_FAILED=()
     for BRANCH in $(git branch --list 'minion/*-iter'$ITERATION 2>/dev/null); do
       BRANCH=$(echo "$BRANCH" | tr -d ' *')
       if git merge "$BRANCH" --no-edit 2>&1; then
+        det "Merged $BRANCH ✓"
         git branch -d "$BRANCH" 2>/dev/null || true
       else
-        det "Merge conflict on $BRANCH — skipping"
+        # Try rebase instead of merge
         git merge --abort 2>&1 || true
+        det "Merge conflict on $BRANCH — trying rebase..."
+        if git rebase "$MAIN_BRANCH" "$BRANCH" 2>&1 && \
+           git checkout "$MAIN_BRANCH" 2>&1 && \
+           git merge "$BRANCH" --no-edit 2>&1; then
+          det "Rebased and merged $BRANCH ✓"
+          git branch -d "$BRANCH" 2>/dev/null || true
+        else
+          git rebase --abort 2>/dev/null || true
+          git checkout "$MAIN_BRANCH" 2>/dev/null || true
+          MERGE_FAILED+=("$BRANCH")
+          det "CONFLICT: $BRANCH could not be merged or rebased — branch preserved for manual review"
+        fi
       fi
     done
+    if [[ ${#MERGE_FAILED[@]} -gt 0 ]]; then
+      det "Unmerged branches (${#MERGE_FAILED[@]}): ${MERGE_FAILED[*]}"
+      echo "MERGE_CONFLICTS: ${MERGE_FAILED[*]}" >> "$RESULTS_FILE"
+    fi
   else
     # ── SEQUENTIAL MODE ──
     while IFS=$'\t' read -r TASK_NAME TASK_PROMPT; do
